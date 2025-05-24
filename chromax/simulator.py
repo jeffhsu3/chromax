@@ -14,6 +14,7 @@ from jaxtyping import Array, Float, Int
 from . import functional
 from .index_functions import conventional_index
 from .trait_model import TraitModel
+from .rrblup_trait_model import RRBLUPTraitModel
 from .typing import Parents, Population
 
 
@@ -77,9 +78,32 @@ class Simulator:
         seed: Optional[int] = None,
         device: xc.Device = None,
         backend: Union[str, xc._xla.Client] = None,
+        gebv_model_type: str = "linear",
+        lambda_rrblup: Optional[float] = None,
     ):
         # :TODO add genotype error
-        """Initialization method. See class docstring for information about parameters."""
+        """
+        Args:
+            genetic_map: Path or DataFrame for the genetic map. Details in class docstring.
+            trait_names: List of trait names. Details in class docstring.
+            chr_column: Name of chromosome column. Details in class docstring.
+            position_column: Name of position column (cM). Details in class docstring.
+            recombination_column: Name of recombination rate column. Details in class docstring.
+            mutation_probability: Probability of mutation. Details in class docstring.
+            mutation_mask_index: Optional array to mask mutations. Details in class docstring.
+            h2: Narrow-sense heritability. Details in class docstring.
+            genotype_error: Probability of genotype error (TODO). Details in class docstring.
+            seed: Random seed. Details in class docstring.
+            device: JAX device. Details in class docstring.
+            backend: JAX backend. Details in class docstring.
+            gebv_model_type (str): Specifies the type of GEBV model.
+                Options: "linear" (default, uses pre-defined marker effects from
+                `genetic_map`) or "rrblup" (uses `RRBLUPTraitModel`, requires
+                training via `train_rrblup_model`).
+            lambda_rrblup (Optional[float]): Regularization parameter for RR-BLUP,
+                used if `gebv_model_type` is "rrblup". Can be overridden in
+                `train_rrblup_model`.
+        """
         self.random_key = None
         if seed is None:
             seed = random.randint(0, 2**32)
@@ -104,17 +128,28 @@ class Simulator:
             genetic_map = pd.read_table(genetic_map, sep="\t")
         if trait_names is None:
             other_col = {chr_column, position_column, recombination_column}
-            trait_names = genetic_map.columns.drop(other_col, errors="ignore")
+            trait_names = genetic_map.columns.drop(other_col, errors="ignore").tolist()
         self.trait_names = trait_names
 
         self.n_markers = len(genetic_map)
         chr_map = genetic_map[chr_column]
         self.chr_lens = chr_map.groupby(chr_map).count().values
+        self.lambda_rrblup = lambda_rrblup
 
-        mrk_effects = genetic_map[self.trait_names]
-        self.GEBV_model = TraitModel(
-            marker_effects=mrk_effects.to_numpy(dtype=np.float32), device=self.device
-        )
+        if gebv_model_type == "linear":
+            mrk_effects = genetic_map[self.trait_names]
+            self.GEBV_model = TraitModel(
+                marker_effects=mrk_effects.to_numpy(dtype=np.float32), device=self.device
+            )
+        elif gebv_model_type == "rrblup":
+            self.GEBV_model = RRBLUPTraitModel(
+                n_markers=self.n_markers,
+                n_traits=len(self.trait_names),
+                device=self.device
+            )
+        else:
+            raise ValueError(f"Unknown gebv_model_type: {gebv_model_type}. Choose 'linear' or 'rrblup'.")
+
 
         if h2 is None:
             h2 = np.full((len(self.trait_names),), 0.5)
@@ -496,11 +531,18 @@ class Simulator:
             It contains the GEBV of each trait for each individual.
         :rtype: DataFrame or ndarray
 
+        :Note:
+            If using a GEBV model that requires training (e.g., RR-BLUP, initialized
+            via `gebv_model_type="rrblup"`), the model must be trained using the
+            appropriate training method (e.g., `train_rrblup_model`) before calling
+            this `GEBV` method. Otherwise, it may raise an error if the underlying
+            model is not yet trained (e.g., a `RuntimeError` from `RRBLUPTraitModel`).
+
         :Example:
             >>> from chromax import Simulator, sample_data
             >>> simulator = Simulator(genetic_map=sample_data.genetic_map)
             >>> f1 = simulator.load_population(sample_data.genome)
-            >>> simulator.GEBV(f1).mean()
+            >>> simulator.GEBV(f1).mean() # Using default linear model
             Heading Date              0.196119
             Protein Content          -0.228718
             Plant Height             -5.888406
@@ -510,6 +552,7 @@ class Simulator:
             Spike Emergence Period   -0.933169
             dtype: float32
         """
+        # The underlying GEBV_model (__call__) will raise an error if not trained (for RRBLUP)
         GEBV = self.GEBV_model(population)
         if not raw_array:
             GEBV = pd.DataFrame(GEBV, columns=self.trait_names)
@@ -622,3 +665,55 @@ class Simulator:
         pop_with_centroid = jnp.vstack([mean_pop, monoploid_enc])
         corrcoef = jnp.corrcoef(pop_with_centroid)
         return corrcoef[0, 1:]
+
+    def train_rrblup_model(
+        self,
+        training_population: Population,
+        training_phenotypes: Float[Array, "n_individuals n_traits"],
+        lambda_val: Optional[float] = None
+    ):
+        """
+        Trains the RR-BLUP model if it's the selected GEBV model.
+
+        Args:
+            training_population (Population): Population object with genotype data
+                for the training set. Shape: (n_individuals, n_markers, ploidy_sum_axis).
+                `n_markers` must match the number of markers the Simulator's
+                RRBLUP model was initialized with (derived from the genetic map).
+            training_phenotypes (Float[Array, "n_individuals n_traits"]): Phenotype
+                array for the training set. `n_traits` must match the number of
+                traits the Simulator's RRBLUP model was initialized with (derived from
+                `trait_names` parameter).
+            lambda_val (Optional[float]): The regularization parameter lambda for
+                RR-BLUP. If None, the `lambda_rrblup` value provided during
+                Simulator initialization will be used. This parameter controls the
+                amount of shrinkage applied to marker effects.
+
+        Raises:
+            TypeError: If the current `GEBV_model` in the Simulator is not an
+                instance of `RRBLUPTraitModel`. This occurs if the Simulator was
+                initialized with `gebv_model_type="linear"` (or default).
+            ValueError: If `lambda_val` is not provided to this method AND
+                `self.lambda_rrblup` was not set during Simulator initialization.
+                A lambda value is essential for RR-BLUP.
+        """
+        if not isinstance(self.GEBV_model, RRBLUPTraitModel):
+            raise TypeError(
+                "Current GEBV model is not trainable with RR-BLUP. "
+                "Initialize Simulator with gebv_model_type='rrblup'."
+            )
+
+        lambda_to_use: Optional[float] = None
+        if lambda_val is not None:
+            lambda_to_use = lambda_val
+        elif self.lambda_rrblup is not None:
+            lambda_to_use = self.lambda_rrblup
+        
+        if lambda_to_use is None:
+            raise ValueError("lambda_val must be provided either to this method or during Simulator initialization if using RR-BLUP.")
+
+        # Ensure training_phenotypes is a JAX array (RRBLUPTraitModel expects JAX arrays)
+        if not isinstance(training_phenotypes, jnp.ndarray):
+            training_phenotypes = jnp.asarray(training_phenotypes, dtype=jnp.float32)
+
+        self.GEBV_model.train(training_population, training_phenotypes, lambda_to_use)
